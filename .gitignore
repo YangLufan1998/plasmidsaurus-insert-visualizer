@@ -1,0 +1,25 @@
+# Local environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+.env.*
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# User input data (keep only the instructions)
+input/*
+!input/README.md
+
+# Generated reports
+results/
+
+# Streamlit and editor files
+.streamlit/
+.vscode/
+.idea/

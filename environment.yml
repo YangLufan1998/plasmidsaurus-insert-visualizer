@@ -1,0 +1,12 @@
+name: insert_visualizer
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python>=3.10
+  - biopython>=1.84
+  - pandas>=2.2
+  - numpy>=1.26
+  - plotly>=5.22
+  - streamlit>=1.36
+  - pip
