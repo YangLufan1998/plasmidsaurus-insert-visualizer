@@ -18,11 +18,12 @@ class BatchArtifacts:
     results: list[AnalysisResult]
     metadata: dict
     summary_csv: bytes
+    inserts_fasta: bytes
     results_zip: bytes
 
 
 def run_uploaded_batch(
-    candidate_file: tuple[str, bytes],
+    candidate_file: tuple[str, bytes] | None,
     sample_map_file: tuple[str, bytes],
     backbone_file: tuple[str, bytes],
     sequencing_files: list[tuple[str, bytes]],
@@ -38,7 +39,7 @@ def run_uploaded_batch(
         candidate_root.mkdir()
         sample_root.mkdir()
 
-        candidate_path = write_upload(candidate_root, *candidate_file)
+        candidate_path = write_upload(candidate_root, *candidate_file) if candidate_file else None
         sample_map_path = write_upload(temp_root, *sample_map_file)
         backbone_path = write_upload(temp_root, *backbone_file)
         for name, data in sequencing_files:
@@ -57,13 +58,19 @@ def run_uploaded_batch(
             replacement_marker=replacement_marker,
             flank_length=flank_length,
         )
-        sanitize_output_paths(results, metadata, candidate_path.name, backbone_path.name)
+        sanitize_output_paths(
+            results,
+            metadata,
+            candidate_path.name if candidate_path else "not supplied",
+            backbone_path.name,
+        )
         write_outputs(results, results_dir, metadata.get("missing_notes", []), metadata)
         (results_dir / "run_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         return BatchArtifacts(
             results=results,
             metadata=metadata,
             summary_csv=(results_dir / "summary.csv").read_bytes(),
+            inserts_fasta=(results_dir / "extracted_inserts.fasta").read_bytes(),
             results_zip=zip_directory(results_dir),
         )
 

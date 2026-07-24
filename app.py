@@ -78,9 +78,10 @@ def upload_panel(thresholds: Thresholds) -> BatchArtifacts | None:
     left, right = st.columns(2)
     with left:
         candidate = st.file_uploader(
-            "Candidate ORF FASTA",
+            "Candidate ORF FASTA (optional)",
             type=["fasta", "fa", "fna"],
             key="candidate_upload",
+            help="Leave empty to extract inserts without ORF comparison.",
         )
         sample_map = st.file_uploader(
             "Sample mapping TSV",
@@ -111,13 +112,13 @@ def upload_panel(thresholds: Thresholds) -> BatchArtifacts | None:
         file_name="sample_map_template.tsv",
         mime="text/tab-separated-values",
     )
-    ready = candidate is not None and sample_map is not None and backbone is not None and bool(sequencing)
+    ready = sample_map is not None and backbone is not None and bool(sequencing)
     if st.button("Analyze uploaded files", type="primary", disabled=not ready, use_container_width=True):
         st.session_state.pop("batch_artifacts", None)
         try:
             with st.spinner("Analyzing inserts and full backbones..."):
                 artifacts = run_uploaded_batch(
-                    (candidate.name, candidate.getvalue()),
+                    (candidate.name, candidate.getvalue()) if candidate else None,
                     (sample_map.name, sample_map.getvalue()),
                     (backbone.name, backbone.getvalue()),
                     [(item.name, item.getvalue()) for item in sequencing],
@@ -133,13 +134,21 @@ def upload_panel(thresholds: Thresholds) -> BatchArtifacts | None:
 
 
 def result_downloads(artifacts: BatchArtifacts) -> None:
-    left, right, clear = st.columns([1, 1, 1])
+    left, middle, right, clear = st.columns(4)
     with left:
         st.download_button(
             "Download summary CSV",
             data=artifacts.summary_csv,
             file_name="summary.csv",
             mime="text/csv",
+            use_container_width=True,
+        )
+    with middle:
+        st.download_button(
+            "Download extracted inserts",
+            data=artifacts.inserts_fasta,
+            file_name="extracted_inserts.fasta",
+            mime="text/plain",
             use_container_width=True,
         )
     with right:
@@ -166,6 +175,9 @@ def render_results(artifacts: BatchArtifacts, zoom: float, show_matches: bool) -
         st.warning("No mapped samples were available for review.")
         return
     result_downloads(artifacts)
+    if metadata.get("analysis_mode") == "extraction_only":
+        render_extraction_results(artifacts, zoom, show_matches)
+        return
     result_by_label = {
         f"{r.sample_id} · {r.expected_orf} · {r.status} · {r.percent_identity:.2f}%": r for r in results
     }
@@ -235,13 +247,84 @@ def render_results(artifacts: BatchArtifacts, zoom: float, show_matches: bool) -
     st.caption(f"Loaded {metadata['candidate_count']} candidate ORFs and {metadata['sample_count']} sequenced samples.")
 
 
+def render_extraction_results(artifacts: BatchArtifacts, zoom: float, show_matches: bool) -> None:
+    results = artifacts.results
+    result_by_label = {
+        f"{result.sample_id} · {result.observed_insert_length} bp · {result.status}": result for result in results
+    }
+    selected_label = st.sidebar.radio("Sample list", list(result_by_label))
+    result = result_by_label[selected_label]
+    counts = pd.Series([item.status for item in results]).value_counts()
+    st.caption(
+        f"Extraction-only mode · {len(results)} mapped samples · "
+        f"PASS {counts.get('PASS', 0)}, WARNING {counts.get('WARNING', 0)}, FAIL {counts.get('FAIL', 0)}"
+    )
+    st.html(
+        f"<div>{status_badge(result.status)} <strong>{escape(result.sample_id)}</strong> · "
+        f"{escape(result.colony_name)} · extracted insert</div>"
+    )
+    backbone_variants = result.backbone_mismatches + result.backbone_insertions + result.backbone_deletions
+    st.html(
+        "<div class='summary-grid'>"
+        f"<div class='metric-card'><div class='metric-value'>{result.observed_insert_length} bp</div><div class='metric-name'>Extracted insert</div></div>"
+        f"<div class='metric-card'><div class='metric-value'>{escape(result.orientation)}</div><div class='metric-name'>Sample orientation</div></div>"
+        f"<div class='metric-card'><div class='metric-value'>{escape(result.backbone_status)}</div><div class='metric-name'>Backbone status</div></div>"
+        f"<div class='metric-card'><div class='metric-value'>{result.backbone_identity:.3f}%</div><div class='metric-name'>Backbone identity</div></div>"
+        f"<div class='metric-card'><div class='metric-value'>{result.backbone_coverage:.3f}%</div><div class='metric-name'>Backbone coverage</div></div>"
+        f"<div class='metric-card'><div class='metric-value'>{backbone_variants}</div><div class='metric-name'>Backbone variants</div></div>"
+        "</div>"
+    )
+    st.html(f"<div class='verdict'>{escape(result.verdict)}</div>")
+
+    insert_sequence = result.alignment.get("observed_insert", "")
+    if insert_sequence:
+        fasta = f">{result.sample_id} length={len(insert_sequence)}\n{insert_sequence}\n".encode()
+        st.download_button(
+            "Download selected insert",
+            data=fasta,
+            file_name=f"{result.sample_id}_insert.fasta",
+            mime="text/plain",
+        )
+
+    tab_sequence, tab_backbone, tab_overview = st.tabs(["Extracted Sequence", "Backbone QC", "Overview"])
+    with tab_sequence:
+        st.code(insert_sequence or "No insert was extracted.", language="text", wrap_lines=True)
+    with tab_backbone:
+        st.caption(result.backbone_notes)
+        st.plotly_chart(backbone_track(result, show_matches=show_matches, zoom=zoom), use_container_width=False)
+        backbone_events = pd.DataFrame(result.backbone_events)
+        st.dataframe(
+            backbone_events if not backbone_events.empty else pd.DataFrame(
+                columns=["event_type", "backbone_coordinate", "observed_coordinate", "expected_base", "observed_base"]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+    with tab_overview:
+        rows = [
+            {
+                "sample_id": item.sample_id,
+                "colony_name": item.colony_name,
+                "status": item.status,
+                "insert_length": item.observed_insert_length,
+                "sample_orientation": item.orientation,
+                "backbone_status": item.backbone_status,
+                "backbone_identity": item.backbone_identity,
+                "backbone_coverage": item.backbone_coverage,
+                "source_file": item.source_file,
+            }
+            for item in results
+        ]
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+
 def main() -> None:
     thresholds, zoom, show_matches = sidebar_controls()
     st.title("Insert Sequencing Visualizer")
-    st.caption("Upload a Plasmidsaurus batch to review the expected insert and complete plasmid backbone.")
+    st.caption("Extract inserts from a Plasmidsaurus batch, review the complete backbone, and optionally compare candidate ORFs.")
     artifacts = upload_panel(thresholds)
     if artifacts is None:
-        st.info("Upload all four input groups to start an analysis.")
+        st.info("Upload sample mapping, backbone, and sequencing files. Candidate ORF FASTA is optional.")
         return
     st.divider()
     render_results(artifacts, zoom, show_matches)

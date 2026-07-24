@@ -1,19 +1,20 @@
 # Plasmidsaurus Insert Visualizer
 
-A Streamlit web app for checking Plasmidsaurus colony sequencing results against an expected insert and plasmid backbone.
+A Streamlit web app for extracting inserts from Plasmidsaurus colony sequencing results and checking the plasmid backbone.
 
-The app reports insert variants, ORF identity, frame and stop codons, complete-backbone identity, and separate PASS/WARNING/FAIL results.
+When candidate ORFs are supplied, the app also reports ORF identity, insert variants, frame, and stop codons.
 
 ## Use the Web App
 
-Upload four input groups:
+Upload three required input groups:
 
-1. Candidate ORF FASTA
-2. Sample mapping TSV
-3. Backbone ApE or GenBank file
-4. Plasmidsaurus sequence files, or a ZIP of the result folder
+1. Sample mapping TSV
+2. Backbone ApE or GenBank file
+3. Plasmidsaurus sequence files, or a ZIP of the result folder
 
-Click **Analyze uploaded files**. Results can be viewed in the browser and downloaded as a summary CSV or complete report ZIP.
+Candidate ORF FASTA is optional. When it is omitted, the app runs in extraction-only mode and returns the insert sequences without ORF comparison.
+
+Click **Analyze uploaded files**. Results can be downloaded as extracted-insert FASTA, summary CSV, or a complete report ZIP.
 
 The sample mapping file must be tab-separated:
 
@@ -24,6 +25,14 @@ sample_2	colony_2	HIT_000002
 ```
 
 Sample filenames or FASTA headers must contain matching IDs such as `sample_1`. Candidate FASTA headers must contain IDs such as `HIT_000001`.
+
+In extraction-only mode, `expected_orf` may be omitted:
+
+```text
+sample_id	colony_name
+sample_1	colony_1
+sample_2	colony_2
+```
 
 ## Run Locally
 
