@@ -20,6 +20,6 @@ input/*
 results/
 
 # Streamlit and editor files
-.streamlit/
+.streamlit/secrets.toml
 .vscode/
 .idea/

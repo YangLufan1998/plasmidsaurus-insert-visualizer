@@ -221,18 +221,19 @@ def _parse_with_biopython(path: Path, fmt: str) -> list[SequenceRecord]:
         return []
     records: list[SequenceRecord] = []
     try:
-        for item in SeqIO.parse(str(path), fmt):
-            seq = normalize_nt(str(item.seq))
-            if seq:
-                records.append(
-                    SequenceRecord(
-                        id=item.id or path.stem,
-                        name=item.name or item.id or path.stem,
-                        sequence=seq,
-                        source_file=str(path),
-                        description=item.description or "",
+        with path.open() as handle:
+            for item in SeqIO.parse(handle, fmt):
+                seq = normalize_nt(str(item.seq))
+                if seq:
+                    records.append(
+                        SequenceRecord(
+                            id=item.id or path.stem,
+                            name=item.name or item.id or path.stem,
+                            sequence=seq,
+                            source_file=str(path),
+                            description=item.description or "",
+                        )
                     )
-                )
     except Exception:
         return []
     return records

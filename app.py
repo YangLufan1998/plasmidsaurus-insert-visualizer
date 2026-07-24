@@ -1,21 +1,13 @@
 from __future__ import annotations
 
-from pathlib import Path
+from html import escape
 
 import pandas as pd
 import streamlit as st
 
-from src.analysis import Thresholds, overview_dataframe, run_analysis
+from src.analysis import Thresholds, overview_dataframe
+from src.upload_workflow import BatchArtifacts, run_uploaded_batch
 from src.visualization import alignment_blocks, backbone_track, coordinate_track, status_badge, summary_cards, translation_view
-
-
-ROOT = Path(__file__).resolve().parent
-DEFAULT_INPUT_DIR = ROOT / "input"
-DEFAULT_CANDIDATE_ROOT = DEFAULT_INPUT_DIR
-DEFAULT_SAMPLE_ROOT = DEFAULT_INPUT_DIR / "sequencing_results"
-DEFAULT_SAMPLE_MAP = DEFAULT_INPUT_DIR / "sample_map.tsv"
-DEFAULT_BACKBONE = DEFAULT_INPUT_DIR / "backbone.ape"
-DEFAULT_RESULTS_DIR = ROOT / "results"
 
 
 st.set_page_config(page_title="Insert Sequencing Visualizer", layout="wide")
@@ -36,20 +28,12 @@ body { color: #20242c; }
 .alignment-block { white-space: pre; overflow-x: auto; border: 1px solid #d9dee8; border-radius: 8px; padding: 10px; background: #fff; font-size: 12px; line-height: 1.45; }
 @media (max-width: 900px) { .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 </style>
-""",
+"""
 )
 
 
-def sidebar_controls() -> tuple[str, str, Path, Path, Path, str, int, Thresholds, float, bool, bool]:
-    st.sidebar.title("Samples")
-    with st.sidebar.expander("Input files", expanded=True):
-        candidate_root = st.text_input("Candidate ORF directory", str(DEFAULT_CANDIDATE_ROOT))
-        sample_root = st.text_input("Plasmidsaurus results directory", str(DEFAULT_SAMPLE_ROOT))
-        sample_map = Path(st.text_input("Sample map", str(DEFAULT_SAMPLE_MAP)))
-        backbone = Path(st.text_input("Backbone ApE/GenBank file", str(DEFAULT_BACKBONE)))
-        replacement_marker = st.text_input("Replacement marker", "GGGCCCCCCCT")
-        flank_length = st.number_input("Backbone flank length", min_value=12, max_value=120, value=40, step=1)
-        results_dir = Path(st.text_input("Results directory", str(DEFAULT_RESULTS_DIR)))
+def sidebar_controls() -> tuple[Thresholds, float, bool]:
+    st.sidebar.title("Review settings")
     with st.sidebar.expander("Insert QC thresholds"):
         pass_identity = st.slider("PASS identity threshold (%)", 90.0, 100.0, 99.5, 0.1)
         pass_coverage = st.slider("PASS reference coverage (%)", 80.0, 100.0, 98.0, 0.5)
@@ -63,7 +47,6 @@ def sidebar_controls() -> tuple[str, str, Path, Path, Path, str, int, Thresholds
     with st.sidebar.expander("Track display"):
         zoom = st.slider("Track zoom", 0.7, 3.0, 1.15, 0.05)
         show_matches = st.checkbox("Show matching segments", True)
-    refresh = st.sidebar.button("Refresh analysis", type="primary")
     st.sidebar.markdown(
         """
 <div class="legend">
@@ -87,52 +70,107 @@ def sidebar_controls() -> tuple[str, str, Path, Path, Path, str, int, Thresholds
         backbone_warn_identity,
         backbone_warn_coverage,
     )
-    return candidate_root, sample_root, sample_map, results_dir, backbone, replacement_marker, int(flank_length), thresholds, zoom, show_matches, refresh
+    return thresholds, zoom, show_matches
 
 
-@st.cache_data(show_spinner=False)
-def cached_analysis(
-    candidate_root: str,
-    sample_root: str,
-    sample_map: str,
-    results_dir: str,
-    backbone: str,
-    replacement_marker: str,
-    flank_length: int,
-    thresholds: Thresholds,
-):
-    return run_analysis(
-        candidate_root,
-        sample_root,
-        sample_map,
-        results_dir,
-        thresholds,
-        backbone_path=backbone,
-        replacement_marker=replacement_marker,
-        flank_length=flank_length,
+def upload_panel(thresholds: Thresholds) -> BatchArtifacts | None:
+    st.subheader("Upload a sequencing batch")
+    left, right = st.columns(2)
+    with left:
+        candidate = st.file_uploader(
+            "Candidate ORF FASTA",
+            type=["fasta", "fa", "fna"],
+            key="candidate_upload",
+        )
+        sample_map = st.file_uploader(
+            "Sample mapping TSV",
+            type=["tsv", "txt"],
+            key="sample_map_upload",
+        )
+    with right:
+        backbone = st.file_uploader(
+            "Backbone ApE or GenBank file",
+            type=["ape", "gb", "gbk", "fasta", "fa"],
+            key="backbone_upload",
+        )
+        sequencing = st.file_uploader(
+            "Plasmidsaurus results",
+            type=["zip", "fasta", "fa", "fna", "fastq", "fq", "gb", "gbk", "txt"],
+            accept_multiple_files=True,
+            key="sequencing_upload",
+        )
+    settings_left, settings_right = st.columns(2)
+    with settings_left:
+        replacement_marker = st.text_input("Replacement marker", "GGGCCCCCCCT")
+    with settings_right:
+        flank_length = st.number_input("Backbone flank length", min_value=12, max_value=120, value=40, step=1)
+
+    st.download_button(
+        "Download sample-map template",
+        data=b"sample_id\tcolony_name\texpected_orf\nsample_1\tcolony_1\tHIT_000001\n",
+        file_name="sample_map_template.tsv",
+        mime="text/tab-separated-values",
     )
+    ready = candidate is not None and sample_map is not None and backbone is not None and bool(sequencing)
+    if st.button("Analyze uploaded files", type="primary", disabled=not ready, use_container_width=True):
+        st.session_state.pop("batch_artifacts", None)
+        try:
+            with st.spinner("Analyzing inserts and full backbones..."):
+                artifacts = run_uploaded_batch(
+                    (candidate.name, candidate.getvalue()),
+                    (sample_map.name, sample_map.getvalue()),
+                    (backbone.name, backbone.getvalue()),
+                    [(item.name, item.getvalue()) for item in sequencing],
+                    thresholds,
+                    replacement_marker,
+                    int(flank_length),
+                )
+            st.session_state["batch_artifacts"] = artifacts
+        except Exception as exc:
+            st.error(f"Analysis could not run: {exc}")
+    st.caption("Uploads are processed in a temporary workspace and removed after analysis.")
+    return st.session_state.get("batch_artifacts")
 
 
-def main() -> None:
-    candidate_root, sample_root, sample_map, results_dir, backbone, replacement_marker, flank_length, thresholds, zoom, show_matches, refresh = sidebar_controls()
-    if refresh:
-        cached_analysis.clear()
-    try:
-        with st.spinner("Loading sequences and aligning inserts and backbones..."):
-            results, metadata = cached_analysis(candidate_root, sample_root, str(sample_map), str(results_dir), str(backbone), replacement_marker, flank_length, thresholds)
-    except Exception as exc:
-        st.error(f"Analysis could not run: {exc}")
-        st.stop()
+def result_downloads(artifacts: BatchArtifacts) -> None:
+    left, right, clear = st.columns([1, 1, 1])
+    with left:
+        st.download_button(
+            "Download summary CSV",
+            data=artifacts.summary_csv,
+            file_name="summary.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with right:
+        st.download_button(
+            "Download all reports",
+            data=artifacts.results_zip,
+            file_name="insert_visualizer_results.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
+    with clear:
+        st.button("Clear session results", use_container_width=True, on_click=clear_session)
+
+
+def clear_session() -> None:
+    for key in ["batch_artifacts", "candidate_upload", "sample_map_upload", "backbone_upload", "sequencing_upload"]:
+        st.session_state.pop(key, None)
+
+
+def render_results(artifacts: BatchArtifacts, zoom: float, show_matches: bool) -> None:
+    results = artifacts.results
+    metadata = artifacts.metadata
     if not results:
         st.warning("No mapped samples were available for review.")
-        st.stop()
+        return
+    result_downloads(artifacts)
     result_by_label = {
         f"{r.sample_id} · {r.expected_orf} · {r.status} · {r.percent_identity:.2f}%": r for r in results
     }
-    selected_label = st.sidebar.radio("Sample list", list(result_by_label), label_visibility="collapsed")
+    selected_label = st.sidebar.radio("Sample list", list(result_by_label))
     result = result_by_label[selected_label]
-    st.title("Insert Sequencing Visualizer")
-    st.caption("Insert/ORF review plus full-length backbone QC outside the replacement marker. The default input directory is editable under ./input.")
     counts = pd.Series([item.status for item in results]).value_counts()
     backbone_counts = pd.Series([item.backbone_status for item in results]).value_counts()
     st.caption(
@@ -140,10 +178,10 @@ def main() -> None:
         f"Backbone PASS {backbone_counts.get('PASS', 0)}, WARNING {backbone_counts.get('WARNING', 0)}, FAIL {backbone_counts.get('FAIL', 0)}"
     )
     st.html(
-        f"<div>{status_badge(result.status)} <strong>{result.sample_id}</strong> · {result.colony_name} · expected <code>{result.expected_orf}</code> · best <code>{result.best_matching_orf}</code></div>"
+        f"<div>{status_badge(result.status)} <strong>{escape(result.sample_id)}</strong> · {escape(result.colony_name)} · expected <code>{escape(result.expected_orf)}</code> · best <code>{escape(result.best_matching_orf)}</code></div>"
     )
     st.html(summary_cards(result))
-    st.html(f"<div class='verdict'>{result.verdict}</div>")
+    st.html(f"<div class='verdict'>{escape(result.verdict)}</div>")
 
     st.subheader("Expected ORF Coordinate Track")
     st.plotly_chart(coordinate_track(result, show_matches=show_matches, zoom=zoom), use_container_width=False)
@@ -154,7 +192,7 @@ def main() -> None:
     with tab_backbone:
         st.html(
             "<div class='summary-grid'>"
-            f"<div class='metric-card'><div class='metric-value'>{result.backbone_status}</div><div class='metric-name'>Backbone status</div></div>"
+            f"<div class='metric-card'><div class='metric-value'>{escape(result.backbone_status)}</div><div class='metric-name'>Backbone status</div></div>"
             f"<div class='metric-card'><div class='metric-value'>{result.backbone_identity:.3f}%</div><div class='metric-name'>Identity</div></div>"
             f"<div class='metric-card'><div class='metric-value'>{result.backbone_coverage:.3f}%</div><div class='metric-name'>Coverage</div></div>"
             f"<div class='metric-card'><div class='metric-value'>{result.observed_backbone_length} / {result.expected_backbone_length} bp</div><div class='metric-name'>Observed / expected backbone</div></div>"
@@ -178,9 +216,7 @@ def main() -> None:
     with tab_alignment:
         event_options = ["All events"] + [f"{e['event_type']} at expected nt {e['expected_coordinate']}" for e in result.events[:500]]
         choice = st.selectbox("Focus", event_options)
-        focus = None
-        if choice != "All events":
-            focus = int(choice.rsplit(" ", 1)[-1])
+        focus = None if choice == "All events" else int(choice.rsplit(" ", 1)[-1])
         st.html(alignment_blocks(result, focus_coordinate=focus))
     with tab_translation:
         st.write(
@@ -196,10 +232,19 @@ def main() -> None:
         st.dataframe(pd.DataFrame(result.ranking), width="stretch", hide_index=True)
     with tab_overview:
         st.dataframe(overview_dataframe(results), width="stretch", hide_index=True)
+    st.caption(f"Loaded {metadata['candidate_count']} candidate ORFs and {metadata['sample_count']} sequenced samples.")
 
-    st.caption(
-        f"Loaded {metadata['candidate_count']} candidate ORFs and {metadata['sample_count']} sequenced samples. Unified report: {Path(metadata['results_dir']) / 'index.html'}."
-    )
+
+def main() -> None:
+    thresholds, zoom, show_matches = sidebar_controls()
+    st.title("Insert Sequencing Visualizer")
+    st.caption("Upload a Plasmidsaurus batch to review the expected insert and complete plasmid backbone.")
+    artifacts = upload_panel(thresholds)
+    if artifacts is None:
+        st.info("Upload all four input groups to start an analysis.")
+        return
+    st.divider()
+    render_results(artifacts, zoom, show_matches)
 
 
 if __name__ == "__main__":
