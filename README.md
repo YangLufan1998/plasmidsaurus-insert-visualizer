@@ -49,6 +49,10 @@ streamlit run app.py
 
 Open [http://localhost:8501](http://localhost:8501).
 
+For a local Conda environment instead, run
+`conda env create -f environment-local.yml`. The nonstandard filename keeps
+Streamlit Community Cloud on the faster `requirements.txt` installation path.
+
 The command-line workflow is also available for files stored under `input/`:
 
 ```bash
