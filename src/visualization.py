@@ -312,6 +312,8 @@ def translation_view(result: AnalysisResult) -> pd.DataFrame:
 
 
 def dashboard_html(results: list[AnalysisResult], metadata: dict) -> str:
+    if metadata.get("analysis_mode") == "extraction_only":
+        return extraction_dashboard_html(results, metadata)
     records = []
     for result in results:
         row = asdict(result)
@@ -533,3 +535,39 @@ renderAll();
 </script>
 </body>
 </html>"""
+
+
+def extraction_dashboard_html(results: list[AnalysisResult], metadata: dict) -> str:
+    rows = []
+    details = []
+    for result in results:
+        sequence = result.alignment.get("observed_insert", "")
+        rows.append(
+            "<tr>"
+            f"<td>{escape(result.sample_id)}</td><td>{escape(result.colony_name)}</td>"
+            f"<td>{status_badge(result.status)}</td><td>{result.observed_insert_length} bp</td>"
+            f"<td>{escape(result.orientation)}</td><td>{escape(result.backbone_status)}</td>"
+            f"<td>{result.backbone_identity:.3f}%</td><td>{result.backbone_coverage:.3f}%</td>"
+            "</tr>"
+        )
+        wrapped = "\n".join(sequence[index : index + 80] for index in range(0, len(sequence), 80))
+        details.append(
+            f"<details><summary>{escape(result.sample_id)} · {result.observed_insert_length} bp · {escape(result.status)}</summary>"
+            f"<p>{escape(result.verdict)}</p><pre>{escape(wrapped) if wrapped else 'No insert extracted.'}</pre></details>"
+        )
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Extracted Inserts</title>
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;color:#20242c;background:#f7f8fb}}
+header,main{{max-width:1280px;margin:auto;padding:20px}}header{{background:#fff;border-bottom:1px solid #d9dee8}}
+h1{{font-size:24px;margin:0 0 6px}}p{{line-height:1.5}}.table-wrap{{overflow:auto;background:#fff;border:1px solid #d9dee8;border-radius:8px}}
+table{{border-collapse:collapse;width:100%;min-width:850px}}th,td{{padding:9px;text-align:left;border-bottom:1px solid #e7eaf0;font-size:13px}}th{{color:#667085}}
+details{{margin-top:12px;background:#fff;border:1px solid #d9dee8;border-radius:8px;padding:12px}}summary{{cursor:pointer;font-weight:650}}
+pre{{white-space:pre-wrap;word-break:break-all;background:#f8fafc;padding:12px;border-radius:6px}}.badge{{border-radius:999px;padding:2px 8px;font-size:11px;font-weight:800;white-space:nowrap}}
+</style></head><body>
+<header><h1>Extracted Inserts</h1><p>Candidate ORFs were not supplied. Inserts were extracted between the configured backbone flanks and were not compared with an ORF reference.</p></header>
+<main><div class="table-wrap"><table><thead><tr><th>Sample</th><th>Colony</th><th>Status</th><th>Insert</th><th>Sample orientation</th><th>Backbone</th><th>Identity</th><th>Coverage</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div>
+{''.join(details)}
+<p>Backbone: {escape(str(metadata.get('backbone_path', '')))} · marker: {escape(str(metadata.get('replacement_marker', '')))} · flank: {escape(str(metadata.get('flank_length', '')))} bp</p></main>
+</body></html>"""

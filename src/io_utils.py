@@ -46,11 +46,13 @@ def normalize_nt(seq: str) -> str:
     return re.sub(r"[^A-Za-z]", "", seq).upper().replace("U", "T")
 
 
-def parse_sample_map(path: str | Path) -> dict[str, dict[str, str]]:
+def parse_sample_map(path: str | Path, require_expected_orf: bool = True) -> dict[str, dict[str, str]]:
     import pandas as pd
 
     table = pd.read_csv(path, sep="\t")
-    required = {"sample_id", "colony_name", "expected_orf"}
+    required = {"sample_id", "colony_name"}
+    if require_expected_orf:
+        required.add("expected_orf")
     missing = required - set(table.columns)
     if missing:
         raise ValueError(f"sample map is missing columns: {', '.join(sorted(missing))}")
@@ -62,9 +64,12 @@ def parse_sample_map(path: str | Path) -> dict[str, dict[str, str]]:
         if sample_id in out:
             raise ValueError(f"sample map contains duplicate sample_id: {sample_id}")
         colony_name = str(row["colony_name"])
-        expected_orf = normalize_hit_id(str(row["expected_orf"])) or str(row["expected_orf"])
-        if expected_orf.lower() == "nan":
+        raw_expected_orf = str(row.get("expected_orf", ""))
+        expected_orf = normalize_hit_id(raw_expected_orf) or raw_expected_orf
+        if require_expected_orf and expected_orf.lower() in {"", "nan"}:
             raise ValueError(f"sample map contains an empty expected_orf for {sample_id}")
+        if expected_orf.lower() == "nan":
+            expected_orf = ""
         out[sample_id] = {
             "sample_id": sample_id,
             "colony_name": colony_name,
@@ -221,18 +226,19 @@ def _parse_with_biopython(path: Path, fmt: str) -> list[SequenceRecord]:
         return []
     records: list[SequenceRecord] = []
     try:
-        for item in SeqIO.parse(str(path), fmt):
-            seq = normalize_nt(str(item.seq))
-            if seq:
-                records.append(
-                    SequenceRecord(
-                        id=item.id or path.stem,
-                        name=item.name or item.id or path.stem,
-                        sequence=seq,
-                        source_file=str(path),
-                        description=item.description or "",
+        with path.open() as handle:
+            for item in SeqIO.parse(handle, fmt):
+                seq = normalize_nt(str(item.seq))
+                if seq:
+                    records.append(
+                        SequenceRecord(
+                            id=item.id or path.stem,
+                            name=item.name or item.id or path.stem,
+                            sequence=seq,
+                            source_file=str(path),
+                            description=item.description or "",
+                        )
                     )
-                )
     except Exception:
         return []
     return records

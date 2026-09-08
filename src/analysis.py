@@ -67,6 +67,7 @@ class AnalysisResult:
     notes: str
     verdict: str
     source_file: str
+    analysis_mode: str = "orf_comparison"
     extraction_method: str = "local_alignment"
     backbone_status: str = "NOT CHECKED"
     backbone_identity: float = 0.0
@@ -92,7 +93,7 @@ class AnalysisResult:
 
 
 def run_analysis(
-    candidate_root: str | Path,
+    candidate_root: str | Path | None,
     sample_root: str | Path,
     sample_map_path: str | Path,
     results_dir: str | Path,
@@ -105,16 +106,17 @@ def run_analysis(
     validate_thresholds(thresholds)
     results_dir = Path(results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
-    candidates = load_candidates(candidate_root)
+    candidates = load_candidates(candidate_root) if candidate_root else {}
     samples = load_samples(sample_root)
-    sample_map = parse_sample_map(sample_map_path)
     backbone = load_backbone_sequence(backbone_path)
+    analysis_mode = "orf_comparison" if candidates else "extraction_only"
+    sample_map = parse_sample_map(sample_map_path, require_expected_orf=bool(candidates))
     missing_notes: list[str] = []
-    if not candidates:
-        raise RuntimeError(f"No candidate ORF sequences found under {candidate_root}")
     if not samples:
         raise RuntimeError(f"No Plasmidsaurus sample sequences found under {sample_root}")
-    missing_orfs = sorted({meta["expected_orf"] for meta in sample_map.values()} - set(candidates))
+    if not candidates and not backbone:
+        raise RuntimeError("Candidate ORFs were not supplied, so a backbone is required to extract inserts")
+    missing_orfs = sorted({meta["expected_orf"] for meta in sample_map.values()} - set(candidates)) if candidates else []
     if missing_orfs:
         raise RuntimeError(f"sample map references ORFs absent from the candidate FASTA: {', '.join(missing_orfs)}")
 
@@ -123,13 +125,18 @@ def run_analysis(
         records = samples.get(sample_id, [])
         if not records:
             missing_notes.append(f"{sample_id}: no parseable sample sequence found")
-            results.append(missing_result(sample_id, meta, "No parseable sample sequence found."))
+            results.append(missing_result(sample_id, meta, "No parseable sample sequence found.", analysis_mode))
             continue
-        result = analyze_sample(records, candidates, meta, thresholds, backbone, replacement_marker, flank_length)
+        result = (
+            analyze_sample(records, candidates, meta, thresholds, backbone, replacement_marker, flank_length)
+            if candidates
+            else analyze_sample_extraction_only(records, meta, thresholds, backbone, replacement_marker, flank_length)
+        )
         results.append(result)
 
     metadata = {
         "candidate_count": len(candidates),
+        "analysis_mode": analysis_mode,
         "sample_count": len(samples),
         "missing_notes": missing_notes,
         "candidate_root": str(candidate_root),
@@ -313,6 +320,134 @@ def analyze_sample(
         },
         ranking=[item[0] | {"rank": i + 1} for i, item in enumerate(ranked[:50])],
         runs=runs,
+    )
+
+
+def analyze_sample_extraction_only(
+    records: list[SequenceRecord],
+    meta: dict[str, str],
+    thresholds: Thresholds,
+    backbone: SequenceRecord | None,
+    replacement_marker: str = "GGGCCCCCCCT",
+    flank_length: int = 40,
+) -> AnalysisResult:
+    if backbone is None:
+        raise RuntimeError("A backbone is required when candidate ORFs are not supplied")
+
+    candidates: list[tuple[tuple, SequenceRecord, dict, dict]] = []
+    status_rank = {"PASS": 0, "WARNING": 1, "FAIL": 2, "NOT CHECKED": 3}
+    for record in records:
+        extraction = extract_insert_from_backbone(record.sequence, backbone.sequence, replacement_marker, flank_length)
+        if not extraction:
+            continue
+        backbone_qc = analyze_backbone(extraction, thresholds, reference_loaded=True)
+        variant_burden = (
+            backbone_qc["mismatches"]
+            + backbone_qc["insertions"]
+            + backbone_qc["deletions"]
+            + backbone_qc["ambiguous_bases"]
+        )
+        selection_key = (
+            status_rank.get(backbone_qc["status"], 4),
+            variant_burden,
+            -backbone_qc["identity"],
+            -backbone_qc["coverage"],
+            record.source_file,
+        )
+        candidates.append((selection_key, record, extraction, backbone_qc))
+
+    if not candidates:
+        backbone_qc = analyze_backbone(None, thresholds, reference_loaded=True)
+        note = "insert-flanking anchors were not both found; insert could not be extracted"
+        return extraction_result(meta, records[0], "", None, backbone_qc, "FAIL", note)
+
+    candidates.sort(key=lambda item: item[0])
+    _, record, extraction, backbone_qc = candidates[0]
+    note = f"insert extracted from backbone flanks; {backbone_qc['notes']}"
+    return extraction_result(
+        meta,
+        record,
+        extraction["insert"],
+        extraction,
+        backbone_qc,
+        backbone_qc["status"],
+        note,
+    )
+
+
+def extraction_result(
+    meta: dict[str, str],
+    record: SequenceRecord,
+    insert: str,
+    extraction: dict | None,
+    backbone_qc: dict,
+    status: str,
+    note: str,
+) -> AnalysisResult:
+    sample_orientation = extraction["sample_orientation"] if extraction else "unknown"
+    verdict = (
+        f"{status}: extracted {len(insert)} bp insert for {meta['sample_id']} ({meta['colony_name']}). "
+        f"Backbone QC {backbone_qc['status']}: {backbone_qc['identity']:.3f}% identity and "
+        f"{backbone_qc['coverage']:.3f}% coverage. {note}."
+        if insert
+        else f"FAIL: no insert was extracted for {meta['sample_id']} ({meta['colony_name']}). {note}."
+    )
+    return AnalysisResult(
+        sample_id=meta["sample_id"],
+        colony_name=meta["colony_name"],
+        expected_orf="",
+        best_matching_orf="not compared",
+        status=status,
+        observed_insert_length=len(insert),
+        expected_orf_length=0,
+        length_difference=0,
+        percent_identity=0.0,
+        query_coverage=0.0,
+        reference_coverage=0.0,
+        orientation=sample_orientation,
+        matches=0,
+        mismatches=0,
+        insertions=0,
+        deletions=0,
+        ambiguous_bases=0,
+        starts_with_atg=insert.startswith("ATG"),
+        length_divisible_by_3=bool(insert) and len(insert) % 3 == 0,
+        frameshift=False,
+        internal_stop_codon_count=0,
+        expected_stop_codon_position="",
+        observed_stop_codon_positions="",
+        amino_acid_translation_summary="not evaluated without a candidate ORF",
+        notes=note,
+        verdict=verdict,
+        source_file=record.source_file,
+        analysis_mode="extraction_only",
+        extraction_method="backbone_flank" if insert else "not_extracted",
+        backbone_status=backbone_qc["status"],
+        backbone_identity=backbone_qc["identity"],
+        backbone_coverage=backbone_qc["coverage"],
+        observed_backbone_length=backbone_qc["observed_length"],
+        expected_backbone_length=backbone_qc["expected_length"],
+        backbone_length_difference=backbone_qc["length_difference"],
+        backbone_matches=backbone_qc["matches"],
+        backbone_mismatches=backbone_qc["mismatches"],
+        backbone_insertions=backbone_qc["insertions"],
+        backbone_deletions=backbone_qc["deletions"],
+        backbone_ambiguous_bases=backbone_qc["ambiguous_bases"],
+        backbone_notes=backbone_qc["notes"],
+        backbone_events=backbone_qc["events"],
+        backbone_runs=backbone_qc["runs"],
+        backbone_alignment=backbone_qc["alignment"],
+        alignment={
+            "observed_insert": insert,
+            "observed_record_id": record.id,
+            "sample_orientation": sample_orientation,
+        },
+        ends={
+            "observed_first60": insert[:60],
+            "expected_first60": "",
+            "observed_last60": insert[-60:],
+            "expected_last60": "",
+        },
     )
 
 
@@ -684,11 +819,11 @@ def verdict_text(status: str, sample_id: str, colony: str, expected: str, best: 
     return f"{status}: {sample_id} ({colony}) expected {expected}; best match {best}. Identity {identity:.2f}%, reference coverage {coverage:.2f}%, orientation {orientation}. {notes}. {action}"
 
 
-def missing_result(sample_id: str, meta: dict[str, str], note: str) -> AnalysisResult:
+def missing_result(sample_id: str, meta: dict[str, str], note: str, analysis_mode: str = "orf_comparison") -> AnalysisResult:
     return AnalysisResult(
         sample_id=sample_id,
         colony_name=meta["colony_name"],
-        expected_orf=meta["expected_orf"],
+        expected_orf=meta.get("expected_orf", ""),
         best_matching_orf="",
         status="WARNING",
         observed_insert_length=0,
@@ -713,6 +848,7 @@ def missing_result(sample_id: str, meta: dict[str, str], note: str) -> AnalysisR
         notes=note,
         verdict=f"WARNING: {note}",
         source_file="",
+        analysis_mode=analysis_mode,
     )
 
 
@@ -768,6 +904,29 @@ def validate_thresholds(thresholds: Thresholds) -> None:
 
 
 def overview_dataframe(results: list[AnalysisResult]) -> pd.DataFrame:
+    if results and all(result.analysis_mode == "extraction_only" for result in results):
+        return pd.DataFrame(
+            [
+                {
+                    "sample_id": result.sample_id,
+                    "colony_name": result.colony_name,
+                    "status": result.status,
+                    "extracted_insert_sequence": result.alignment.get("observed_insert", ""),
+                    "observed_insert_length": result.observed_insert_length,
+                    "sample_orientation": result.orientation,
+                    "backbone_status": result.backbone_status,
+                    "backbone_identity": result.backbone_identity,
+                    "backbone_coverage": result.backbone_coverage,
+                    "backbone_length_difference": result.backbone_length_difference,
+                    "backbone_mismatches": result.backbone_mismatches,
+                    "backbone_insertions": result.backbone_insertions,
+                    "backbone_deletions": result.backbone_deletions,
+                    "source_file": result.source_file,
+                    "notes": result.notes,
+                }
+                for result in results
+            ]
+        )
     rows = []
     for result in results:
         row = asdict(result)
@@ -780,16 +939,18 @@ def overview_dataframe(results: list[AnalysisResult]) -> pd.DataFrame:
 def write_outputs(results: list[AnalysisResult], results_dir: Path, missing_notes: list[str], metadata: dict | None = None) -> None:
     overview = overview_dataframe(results)
     overview.to_csv(results_dir / "summary.csv", index=False)
+    (results_dir / "extracted_inserts.fasta").write_text(extracted_inserts_fasta(results), encoding="utf-8")
     if missing_notes:
         (results_dir / "missing_or_ambiguous_files.txt").write_text("\n".join(missing_notes) + "\n", encoding="utf-8")
     else:
         (results_dir / "missing_or_ambiguous_files.txt").write_text("No missing or unparseable expected samples detected.\n", encoding="utf-8")
     for result in results:
         prefix = results_dir / result.sample_id
-        pd.DataFrame(result.events).to_csv(prefix.with_suffix(".events.tsv"), sep="\t", index=False)
         pd.DataFrame(result.backbone_events).to_csv(prefix.with_suffix(".backbone_events.tsv"), sep="\t", index=False)
-        pd.DataFrame(result.stops).to_csv(prefix.with_suffix(".stops.tsv"), sep="\t", index=False)
-        pd.DataFrame(result.ranking).to_csv(prefix.with_suffix(".ranking.tsv"), sep="\t", index=False)
+        if result.analysis_mode != "extraction_only":
+            pd.DataFrame(result.events).to_csv(prefix.with_suffix(".events.tsv"), sep="\t", index=False)
+            pd.DataFrame(result.stops).to_csv(prefix.with_suffix(".stops.tsv"), sep="\t", index=False)
+            pd.DataFrame(result.ranking).to_csv(prefix.with_suffix(".ranking.tsv"), sep="\t", index=False)
         prefix.with_suffix(".report.html").write_text(sample_report_html(result), encoding="utf-8")
     try:
         from .visualization import dashboard_html
@@ -800,6 +961,8 @@ def write_outputs(results: list[AnalysisResult], results_dir: Path, missing_note
 
 
 def sample_report_html(result: AnalysisResult) -> str:
+    if result.analysis_mode == "extraction_only":
+        return extraction_sample_report_html(result)
     event_rows = "".join(
         f"<tr><td>{escape(str(e.get('event_type', '')))}</td><td>{e.get('expected_coordinate','')}</td><td>{e.get('observed_coordinate','')}</td><td>{escape(str(e.get('expected_base','')))}</td><td>{escape(str(e.get('observed_base','')))}</td><td>{escape(str(e.get('amino_acid_consequence','')))}</td></tr>"
         for e in result.events[:500]
@@ -828,6 +991,45 @@ def sample_report_html(result: AnalysisResult) -> str:
 	</tbody></table>
 	<h2>Variant Events</h2><table><thead><tr><th>Event</th><th>Expected nt</th><th>Observed nt</th><th>Expected</th><th>Observed</th><th>AA consequence</th></tr></thead><tbody>{event_rows or '<tr><td colspan="6">No events.</td></tr>'}</tbody></table>
 	<h2>Backbone Events</h2><table><thead><tr><th>Event</th><th>Backbone nt</th><th>Observed nt</th><th>Expected</th><th>Observed</th></tr></thead><tbody>{backbone_event_rows or '<tr><td colspan="5">No backbone events.</td></tr>'}</tbody></table>
+</body></html>"""
+
+
+def extracted_inserts_fasta(results: list[AnalysisResult]) -> str:
+    lines: list[str] = []
+    for result in results:
+        sequence = result.alignment.get("observed_insert", "")
+        if not sequence:
+            continue
+        sample_id = "".join(char if char.isalnum() or char in "._-" else "_" for char in result.sample_id)
+        colony = " ".join(result.colony_name.split())
+        lines.append(f">{sample_id} colony={colony} length={len(sequence)}")
+        lines.extend(sequence[index : index + 80] for index in range(0, len(sequence), 80))
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def extraction_sample_report_html(result: AnalysisResult) -> str:
+    sequence = result.alignment.get("observed_insert", "")
+    wrapped_sequence = "\n".join(sequence[index : index + 80] for index in range(0, len(sequence), 80))
+    backbone_event_rows = "".join(
+        f"<tr><td>{escape(str(e.get('event_type', '')))}</td><td>{e.get('backbone_coordinate','')}</td><td>{e.get('observed_coordinate','')}</td><td>{escape(str(e.get('expected_base','')))}</td><td>{escape(str(e.get('observed_base','')))}</td></tr>"
+        for e in result.backbone_events[:500]
+    )
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>{escape(result.sample_id)} extracted insert</title>
+<style>body{{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;margin:24px;color:#20242c}}table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #d9dee8;padding:6px;text-align:left}}pre{{white-space:pre-wrap;word-break:break-all;border:1px solid #d9dee8;padding:12px;border-radius:6px}}</style></head>
+<body><h1>{escape(result.sample_id)} · extracted insert</h1>
+<p><strong>{escape(result.status)}</strong></p><p>{escape(result.verdict)}</p>
+<table><tbody>
+<tr><th>Colony</th><td>{escape(result.colony_name)}</td></tr>
+<tr><th>Source</th><td>{escape(result.source_file)}</td></tr>
+<tr><th>Insert length</th><td>{result.observed_insert_length} bp</td></tr>
+<tr><th>Sample orientation</th><td>{escape(result.orientation)}</td></tr>
+<tr><th>Backbone status</th><td>{escape(result.backbone_status)}</td></tr>
+<tr><th>Backbone identity</th><td>{result.backbone_identity}%</td></tr>
+<tr><th>Backbone coverage</th><td>{result.backbone_coverage}%</td></tr>
+</tbody></table>
+<h2>Extracted Insert</h2><pre>{escape(wrapped_sequence) if wrapped_sequence else 'No insert extracted.'}</pre>
+<h2>Backbone Events</h2><table><thead><tr><th>Event</th><th>Backbone nt</th><th>Observed nt</th><th>Expected</th><th>Observed</th></tr></thead><tbody>{backbone_event_rows or '<tr><td colspan="5">No backbone events.</td></tr>'}</tbody></table>
 </body></html>"""
 
 
